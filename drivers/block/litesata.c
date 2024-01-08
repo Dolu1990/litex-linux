@@ -38,6 +38,7 @@ Example DTS node (adjust with your own addresses from csr.csv):
 #include <linux/litex.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 
 #define LITESATA_ID_STRT   0x00 // 1bit, w
@@ -56,10 +57,11 @@ Example DTS node (adjust with your own addresses from csr.csv):
 #define LSPHY_STS_CTL BIT(3)
 
 #define LITESATA_DMA_SECT  0x00 // 48bit, w
-#define LITESATA_DMA_ADDR  0x08 // 64bit, w
-#define LITESATA_DMA_STRT  0x10 // 1bit, w
-#define LITESATA_DMA_DONE  0x14 // 1bit, ro
-#define LITESATA_DMA_ERR   0x18 // 1bit, ro
+#define LITESATA_DMA_NSEC  0x08 // 16bit, w
+#define LITESATA_DMA_ADDR  0x0c // 64bit, w
+#define LITESATA_DMA_STRT  0x14 // 1bit, w
+#define LITESATA_DMA_DONE  0x18 // 1bit, ro
+#define LITESATA_DMA_ERR   0x1c // 1bit, ro
 
 #define LITESATA_IRQ_STS   0x00 // 2bit, ro
 #define LITESATA_IRQ_PEND  0x04 // 2bit, rw
@@ -71,6 +73,8 @@ Example DTS node (adjust with your own addresses from csr.csv):
 struct litesata_dev {
 	struct device *dev;
 
+	struct mutex lock;
+
 	void __iomem *lsident;
 	void __iomem *lsphy;
 	void __iomem *lsreader;
@@ -81,8 +85,9 @@ struct litesata_dev {
 	int irq;
 };
 
-static int litesata_do_dma_sector(struct litesata_dev *lbd, void __iomem *regs,
-				  sector_t sector, dma_addr_t dma)
+/* caller must hold lbd->lock to prevent interleaving transfers */
+static int litesata_do_dma(struct litesata_dev *lbd, void __iomem *regs,
+			   dma_addr_t dma, sector_t sector, unsigned int count)
 {
 	int irq = lbd->irq;
 
@@ -91,13 +96,15 @@ static int litesata_do_dma_sector(struct litesata_dev *lbd, void __iomem *regs,
 
 	/* NOTE: do *not* start by writing 0 to LITESATA_DMA_STRT!!! */
 	litex_write64(regs + LITESATA_DMA_SECT, sector);
+	litex_write16(regs + LITESATA_DMA_NSEC, count);
 	litex_write64(regs + LITESATA_DMA_ADDR, dma);
 	litex_write8(regs + LITESATA_DMA_STRT, 1);
 
 	if (irq)
 		wait_for_completion(&lbd->dma_done);
 
-	/* wait for DMA xfer completion */
+	// FIXME: should we implement a timeout here?
+	// (or some other way to improve polling mode)?
 	while ((litex_read8(regs + LITESATA_DMA_DONE) & 0x01) == 0);
 
 	/* check if DMA xfer successful */
@@ -106,23 +113,6 @@ static int litesata_do_dma_sector(struct litesata_dev *lbd, void __iomem *regs,
 
 	dev_err(lbd->dev, "failed transfering sector %Ld\n", sector);
 	return -EIO;
-}
-
-static int litesata_do_dma(struct litesata_dev *lbd, void __iomem *regs,
-			   dma_addr_t dma, sector_t sector, unsigned int count)
-{
-	int err;
-
-	while (count--) {
-		err = litesata_do_dma_sector(lbd, regs, sector, dma);
-		if (err)
-			return err;
-
-		sector++;
-		dma += SECTOR_SIZE;
-	}
-
-	return 0;
 }
 
 /* Process a single bvec of a bio. */
@@ -150,12 +140,9 @@ static int litesata_do_bvec(struct litesata_dev *lbd, struct bio_vec *bv,
 		return err;
 
 	count = bv->bv_len >> SECTOR_SHIFT;
-	// FIXME: I want to know if we ever transfer a number of
-	// contiguous blocks other than 1 or 8 !!!
-	if (count != 1 && count != 8)
-		dev_warn(dev, "### === --- %s %d sectors --- === ###\n",
-			 op_is_write(op) ? "writing" : "reading", count);
+	mutex_lock(&lbd->lock);
 	err = litesata_do_dma(lbd, regs, dma, sector, count);
+	mutex_unlock(&lbd->lock);
 	if (err)
 		return err;
 
@@ -273,16 +260,16 @@ static int litesata_init_ident(struct litesata_dev *lbd, sector_t *size)
 
 	/* reset phy */
 	litex_write8(lbd->lsphy + LITESATA_PHY_ENA, 0);
-	msleep(1);
+	msleep(5);
 	litex_write8(lbd->lsphy + LITESATA_PHY_ENA, 1);
-	msleep(100);
+	msleep(400);
 	/* check phy status */
 	if ((litex_read8(lbd->lsphy + LITESATA_PHY_STS) & LSPHY_STS_RDY) == 0)
 		return -ENODEV;
 
 	/* initiate `identify` sequence */
 	litex_write8(lbd->lsident + LITESATA_ID_STRT, 1);
-	msleep(100);
+	msleep(400);
 	/* check `identify` status */
 	if ((litex_read8(lbd->lsident + LITESATA_ID_DONE) & 0x01) == 0)
 		return -ENODEV;
@@ -334,6 +321,8 @@ static int litesata_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	lbd->dev = dev;
+
+	mutex_init(&lbd->lock);
 
 	lbd->lsident = devm_platform_ioremap_resource_byname(pdev, "ident");
 	if (IS_ERR(lbd->lsident))

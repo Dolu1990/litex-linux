@@ -24,11 +24,11 @@
 
 #define TEMP_REG_OFFSET               0x0
 #define TEMP_REG_SIZE                 2
-#define VCCINT_REG_OFFSET             0x8
+#define VCCINT_REG_OFFSET             0x4
 #define VCCINT_REG_SIZE               2
-#define VCCAUX_REG_OFFSET             0x10
+#define VCCAUX_REG_OFFSET             0x8
 #define VCCAUX_REG_SIZE               2
-#define VCCBRAM_REG_OFFSET            0x18
+#define VCCBRAM_REG_OFFSET            0xC
 #define VCCBRAM_REG_SIZE              2
 
 #define CHANNEL_TEMP                  0
