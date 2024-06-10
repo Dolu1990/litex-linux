@@ -66,7 +66,7 @@
 #define SD_BIT_TIMEOUT BIT(2)
 #define SD_BIT_CRC_ERR BIT(3)
 
-#define SD_SLEEP_US       5
+#define SD_SLEEP_US       0
 #define SD_TIMEOUT_US 20000
 
 #define SDIRQ_CARD_DETECT    1
