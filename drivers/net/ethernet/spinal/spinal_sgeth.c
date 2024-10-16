@@ -28,9 +28,11 @@
 
 TODO tx need to ensure there is enough descriptor free, else need to throttle
 TODO napi_alloc_skb ?
-
+netdev_fix_features
+ethtool -k eth0
  */
 
+//#define DEBUG
 
 #define DRV_NAME	"spinal-sgeth"
 #define TX_DMA_CONTROL 0x00
@@ -458,11 +460,11 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 //	print_hex_dump(KERN_ERR, "TX: ", DUMP_PREFIX_OFFSET,
 //			   16, 1, skb->data, skb_headlen(skb), 1);
 
-	if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		unsigned int csum_start_off = skb_checksum_start_offset(skb);
-		unsigned int csum_index_off = csum_start_off + skb->csum_offset;
-		netdev_info(ndev, "CHECKSUM_PARTIAL ??\n");
-	}
+//	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+//		unsigned int csum_start_off = skb_checksum_start_offset(skb);
+//		unsigned int csum_index_off = csum_start_off + skb->csum_offset;
+//		netdev_info(ndev, "CHECKSUM_PARTIAL ??\n");
+//	}
 
 	skb_dma_addr = dma_map_single(ndev->dev.parent, skb->data,
 				      skb_headlen(skb), DMA_TO_DEVICE);
@@ -481,6 +483,14 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 	desc_id_masked = desc_id & (priv->tx_desc_count-1);
 //	printk("B\n");
 	for (int ii = 0; ii < num_frag; ii++) {
+//		netdev_info(priv->ndev, "-  %d bytes\n", skb_frag_size(frag));
+//		print_hex_dump(KERN_ERR, "TX: ", DUMP_PREFIX_OFFSET,
+//				   16, 1, skb_frag_address(frag), skb_frag_size(frag), 1);
+
+		if(skb_frag_size(frag) < 1){
+			netdev_info(priv->ndev, "Zero byte fragment ????\n");
+		}
+
 		desc = priv->tx_desc_virt + desc_id_masked;
 		skb_dma_addr = dma_map_single(ndev->dev.parent,
 					      skb_frag_address(frag),
@@ -761,9 +771,15 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 	if (err)
 		eth_hw_addr_random(ndev);
 
+//	ndev->mtu = 9000;
 	ndev->netdev_ops = &spinal_sgeth_netdev_ops;
 	ndev->features  = NETIF_F_SG;
-	ndev->features |= NETIF_F_HIGHDMA; /* Can DMA to high memory. */
+	ndev->features |= NETIF_F_HIGHDMA;
+	ndev->features |= NETIF_F_GSO;
+	ndev->features |= NETIF_F_IP_CSUM;
+//	ndev->features |= NETIF_F_TSO;
+//	ndev->features |= NETIF_F_GSO_FRAGLIST;
+//	ndev->features |= NETIF_F_FRAGLIST;
 
 #if 0
 	ndev->features |= NETIF_F_IP_CSUM; /* Can checksum TCP/UDP over IPv4. */
@@ -786,6 +802,7 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 	}
 
 	netdev_info(ndev, "Hello world \n");
+	netdev_dbg(ndev, "Brawwwww\n");
 	return 0;
 }
 
