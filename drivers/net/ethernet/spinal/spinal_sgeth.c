@@ -777,7 +777,7 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 	ndev->features |= NETIF_F_HIGHDMA;
 	ndev->features |= NETIF_F_GSO;
 	ndev->features |= NETIF_F_IP_CSUM;
-//	ndev->features |= NETIF_F_TSO;
+	ndev->features |= NETIF_F_TSO;
 //	ndev->features |= NETIF_F_GSO_FRAGLIST;
 //	ndev->features |= NETIF_F_FRAGLIST;
 
