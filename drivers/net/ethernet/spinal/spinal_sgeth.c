@@ -46,6 +46,8 @@ tx 170 -> hw crc 250 -> tso 350
 #define TX_DMA_STATUS_START 1
 #define TX_DMA_STATUS_GOING_IDLE_BUSY (1 << 4)
 #define TX_DMA_STATUS_GOING_IDLE_VALUE (1 << 5)
+#define TX_DMA_STATUS_IRQ_ENABLE (1 << 8)
+#define TX_DMA_STATUS_IRQ_DISABLE (1 << 9)
 
 #define TX_DMA_DESC_STATUS_COMPLETED (1 << 31)
 
@@ -60,7 +62,7 @@ tx 170 -> hw crc 250 -> tso 350
 
 #define SGETH_HDR_SIZE			14      /* size of Ethernet header */
 #define SGETH_TRL_SIZE			4       /* size of Ethernet trailer (FCS) */
-#define SGETH_JUMBO_MTU			9000
+#define SGETH_JUMBO_MTU			1500//9000
 #define SGETH_MAX_JUMBO_FRAME_SIZE	(SGETH_JUMBO_MTU + SGETH_HDR_SIZE + SGETH_TRL_SIZE)
 
 
@@ -91,6 +93,12 @@ inline static int spinal_sgeth_tx_dma_is_going_idle(void __iomem * dma){
 		if((status & TX_DMA_STATUS_GOING_IDLE_BUSY) == 0) return status & TX_DMA_STATUS_GOING_IDLE_VALUE;
 	}
 }
+inline static void spinal_sgeth_tx_dma_irq_enable(void __iomem * dma){
+    return writel_relaxed(TX_DMA_STATUS_IRQ_ENABLE, dma + TX_DMA_CONTROL);
+}
+inline static void spinal_sgeth_tx_dma_irq_disable(void __iomem * dma){
+    return writel_relaxed(TX_DMA_STATUS_IRQ_DISABLE, dma + TX_DMA_CONTROL);
+}
 
 
 
@@ -101,6 +109,8 @@ inline static int spinal_sgeth_tx_dma_is_going_idle(void __iomem * dma){
 
 #define RX_DMA_STATUS_BUSY 1
 #define RX_DMA_STATUS_START 1
+#define RX_DMA_STATUS_IRQ_ENABLE (1 << 8)
+#define RX_DMA_STATUS_IRQ_DISABLE (1 << 9)
 
 #define RX_DMA_IRQ_IDLE_ENABLE 0x1
 #define RX_DMA_IRQ_DELAY_ENABLE 0x2
@@ -117,7 +127,7 @@ inline static int spinal_sgeth_tx_dma_is_going_idle(void __iomem * dma){
 #define RX_DMA_DESC_CONTROL_IRQ_LAST (1 << 30)
 
 
-// Should be aligned to 64 bytes !
+// Should be aligned to 32 bytes !
 struct sgeth_rx_descriptor {
    u32 status;
    u32 control;
@@ -136,7 +146,12 @@ inline static void spinal_sgeth_rx_dma_set_next(void __iomem * dma, u64 next){
 	writel_relaxed(next, dma + RX_DMA_NEXT);
     writel_relaxed(next >> 32, dma + RX_DMA_NEXT + 4);
 }
-
+inline static void spinal_sgeth_rx_dma_irq_enable(void __iomem * dma){
+    return writel_relaxed(RX_DMA_STATUS_IRQ_ENABLE, dma + RX_DMA_CONTROL);
+}
+inline static void spinal_sgeth_rx_dma_irq_disable(void __iomem * dma){
+    return writel_relaxed(RX_DMA_STATUS_IRQ_DISABLE, dma + RX_DMA_CONTROL);
+}
 
 struct spinal_sgeth {
 	struct net_device *ndev;
@@ -167,13 +182,14 @@ struct spinal_sgeth {
 	spinlock_t rx_lock;
 	int rx_irq_first;
 	u32 rx_irq_config;
+	struct napi_struct rx_napi;
+
 
 	struct timer_list poll_timer;
-
 };
 
 inline static int spinal_sgeth_get_tx_available(struct spinal_sgeth *priv){
-	return priv->tx_desc_count - (priv->tx_desc_alloc - priv->tx_desc_free); //TODO 20
+	return priv->tx_desc_count - (priv->tx_desc_alloc - priv->tx_desc_free);
 }
 
 static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
@@ -222,9 +238,7 @@ static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 
 static inline int spinal_sgeth_rx_refill(struct spinal_sgeth *priv, int index){
 	dma_addr_t skb_dma_addr;
-	struct sk_buff *skb = __netdev_alloc_skb_ip_align(priv->ndev,
-					  SGETH_MAX_JUMBO_FRAME_SIZE,
-					  GFP_KERNEL);
+	struct sk_buff *skb = napi_alloc_skb(&priv->rx_napi, SGETH_MAX_JUMBO_FRAME_SIZE);
 	if (!skb){
 		netdev_err(priv->ndev, "Can't allocate enough RX SKB\n");
 		return -ENOMEM;
@@ -245,19 +259,15 @@ static inline int spinal_sgeth_rx_refill(struct spinal_sgeth *priv, int index){
 	return 0;
 }
 
-static irqreturn_t spinal_sgeth_rx_refresh(struct spinal_sgeth *priv)
+static int spinal_sgeth_rx_refresh(struct spinal_sgeth *priv, int budget)
 {
 	int err;
 	unsigned long flags;
+	int works = 0;
 
-	spin_lock_irqsave(&priv->rx_lock, flags); //TODO may not even need this ?
+	spin_lock_irqsave(&priv->rx_lock, flags);
 
-	/* Process all received buffers, passing them on network
-	 * stack.  After this, the buffer descriptors will be in an
-	 * un-allocated stage, where no skb is allocated for it, and
-	 * they are therefore not available for TEMAC/DMA.
-	 */
-	while(1) {
+	while(works != budget) {
 		int desc_ptr = priv->rx_desc_ptr;
 		struct sgeth_rx_descriptor *desc = &priv->rx_desc_virt[desc_ptr];
 		struct sk_buff *skb;
@@ -265,9 +275,12 @@ static irqreturn_t spinal_sgeth_rx_refresh(struct spinal_sgeth *priv)
 
 		writel_relaxed(priv->rx_irq_config, priv->rx_dma + RX_DMA_IRQ);
 
+		mb();
+
 		/* Loop over all completed buffer descriptors */
-		if (!(desc->status & RX_DMA_DESC_STATUS_COMPLETED))
+		if (!(desc->status & RX_DMA_DESC_STATUS_COMPLETED)){
 			break;
+		}
 
 		skb = priv->rx_skb[desc_ptr];
 		if(skb){
@@ -287,16 +300,22 @@ static irqreturn_t spinal_sgeth_rx_refresh(struct spinal_sgeth *priv)
 			skb->protocol = eth_type_trans(skb, priv->ndev);
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
 
-			if (!skb_defer_rx_timestamp(skb))
-				netif_rx(skb);
+////			if (!skb_defer_rx_timestamp(skb)){
+			napi_gro_receive(&priv->rx_napi, skb);
+//			}
 			/* The skb buffer is now owned by network stack above */
 			priv->rx_skb[desc_ptr] = NULL;
 
 			priv->ndev->stats.rx_packets++;
 			priv->ndev->stats.rx_bytes += length;
+
+			works += 1;
 		}
 
-		if(err = spinal_sgeth_rx_refill(priv, desc_ptr)) return IRQ_HANDLED;
+		if(err = spinal_sgeth_rx_refill(priv, desc_ptr)) {
+			dev_err_ratelimited(priv->dev, "spinal_sgeth_rx_refill failed :(");
+			return works;
+		}
 
 		desc_ptr += 1;
 		if(desc_ptr == priv->rx_desc_count) desc_ptr = 0;
@@ -306,7 +325,7 @@ static irqreturn_t spinal_sgeth_rx_refresh(struct spinal_sgeth *priv)
 
 	spin_unlock_irqrestore(&priv->rx_lock, flags);
 
-	return IRQ_HANDLED;
+	return works;
 }
 
 
@@ -318,21 +337,31 @@ inline static void spinal_sgeth_rx_ensure_started(struct spinal_sgeth *priv) {
 		spinal_sgeth_rx_dma_start(priv->rx_dma);
 		if(!priv->rx_irq_first) dev_err_ratelimited(priv->dev, "DMA RX ran out of descriptors :(");
 	}
+	priv->rx_irq_first = 0;
 }
 
 static irqreturn_t spinal_sgeth_rx_irq(int irq, void *_ndev)
 {
 	struct net_device *ndev = _ndev;
 	struct spinal_sgeth *priv = netdev_priv(ndev);
-
-	spinal_sgeth_rx_refresh(priv);
-	spinal_sgeth_rx_ensure_started(priv);
-
-	priv->rx_irq_first = 0;
+	spinal_sgeth_rx_dma_irq_disable(priv->rx_dma);
+	writel_relaxed(priv->rx_irq_config, priv->rx_dma + RX_DMA_IRQ);
+	napi_schedule(&priv->rx_napi);
 	return IRQ_HANDLED;
 }
 
+static int spinal_sgeth_poll(struct napi_struct *napi, int budget){
+	struct spinal_sgeth *priv = container_of(napi, struct spinal_sgeth, rx_napi);
 
+	int works = spinal_sgeth_rx_refresh(priv, budget);
+	spinal_sgeth_rx_ensure_started(priv);
+
+	if (works < budget) {
+		napi_complete_done(napi, works);
+		spinal_sgeth_rx_dma_irq_enable(priv->rx_dma);
+	}
+	return works;
+}
 
 static int spinal_sgeth_open(struct net_device *ndev)
 {
@@ -375,7 +404,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 		return -ENOMEM;
 	}
 
-	priv->rx_desc_count = 128;
+	priv->rx_desc_count = 256;
 	priv->rx_desc_ptr = 0;
 	priv->rx_desc_virt = dma_alloc_coherent(ndev->dev.parent,
 					 sizeof(struct sgeth_rx_descriptor) * priv->rx_desc_count,
@@ -397,11 +426,9 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	if (!priv->rx_skb){
 		return -ENOMEM;
 	}
-//	while(!priv->rx_skb[priv->rx_desc_ptr]){
-//		if(err = spinal_sgeth_rx_refill(priv, i)) break;
-//		priv->rx_desc_ptr = priv->rx_desc_ptr + 1;
-//		if(priv->rx_desc_ptr == priv->rx_desc_count) priv->rx_desc_ptr = 0;
-//	}
+
+	netif_napi_add(ndev, &priv->rx_napi, spinal_sgeth_poll);
+	napi_enable(&priv->rx_napi);
 
 	err = request_irq(priv->tx_irq, spinal_sgeth_tx_irq, 0, ndev->name, ndev);
 	if (err)
@@ -420,11 +447,16 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	priv->rx_irq_config |= RX_DMA_IRQ_DELAY_ENABLE | (50 << RX_DMA_IRQ_DELAY_LIMIT_AT);
 	priv->rx_irq_config |= RX_DMA_IRQ_COUNTER_ENABLE | ((priv->rx_desc_count+3)/4 << RX_DMA_IRQ_COUNTER_TARGET_AT);
 	writel_relaxed(priv->rx_irq_config, priv->rx_dma + RX_DMA_IRQ);
+	spinal_sgeth_rx_dma_irq_enable(priv->rx_dma);
 
 	priv->tx_irq_config |= TX_DMA_IRQ_DELAY_ENABLE | (200 << TX_DMA_IRQ_DELAY_LIMIT_AT);
 	priv->tx_irq_config |= TX_DMA_IRQ_COUNTER_ENABLE | ((priv->tx_desc_count+3)/4 << TX_DMA_IRQ_COUNTER_TARGET_AT);
 //	priv->tx_irq_config = 0;
 	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
+	spinal_sgeth_tx_dma_irq_enable(priv->tx_dma);
+
+
+
 
 	return 0;
 
@@ -503,13 +535,11 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 		return NETDEV_TX_OK;
 	}
 
-//	printk("A\n");
 	desc = priv->tx_desc_virt + desc_id_masked;
 	desc->from = skb_dma_addr;
 	desc->control = skb_headlen(skb) | TX_DMA_DESC_CONTROL_IRQ | (num_frag == 0 ? TX_DMA_DESC_CONTROL_LAST : 0);
 	desc_id += 1;
 	desc_id_masked = desc_id & (priv->tx_desc_count-1);
-//	printk("B\n");
 	for (int ii = 0; ii < num_frag; ii++) {
 //		netdev_info(priv->ndev, "-  %d bytes\n", skb_frag_size(frag));
 //		print_hex_dump(KERN_ERR, "TX: ", DUMP_PREFIX_OFFSET,
@@ -554,7 +584,6 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 		desc_id += 1;
 		desc_id_masked = desc_id & (priv->tx_desc_count-1);
 	}
-//	printk("C\n");
 
 	unsigned long flags;
 	spin_lock_irqsave(&priv->tx_lock, flags);
@@ -825,6 +854,9 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 	ndev->features |= NETIF_F_GSO;
 	ndev->features |= NETIF_F_IP_CSUM;
 	ndev->features |= NETIF_F_TSO;
+
+
+//	ndev->features |= (NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM) | NETIF_F_GRO;
 //	ndev->features |= NETIF_F_GSO_FRAGLIST;
 //	ndev->features |= NETIF_F_FRAGLIST;
 
