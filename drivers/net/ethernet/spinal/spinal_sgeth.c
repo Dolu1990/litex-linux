@@ -28,8 +28,11 @@
 
 TODO tx need to ensure there is enough descriptor free, else need to throttle
 TODO napi_alloc_skb ?
+TODO check hardware TSO mtu size
 netdev_fix_features
 ethtool -k eth0
+
+tx 170 -> hw crc 250 -> tso 350
  */
 
 //#define DEBUG
@@ -82,8 +85,7 @@ inline static void spinal_sgeth_tx_dma_set_next(void __iomem * dma, u64 next){
 	writel_relaxed(next >> 32, dma + TX_DMA_NEXT + 4);
 }
 inline static int spinal_sgeth_tx_dma_is_going_idle(void __iomem * dma){
-	mb();
-	writel_relaxed(TX_DMA_STATUS_GOING_IDLE_BUSY, dma + TX_DMA_CONTROL);
+	writel(TX_DMA_STATUS_GOING_IDLE_BUSY, dma + TX_DMA_CONTROL); //Not relaxed, as we need to ensure possible status updates are synced
 	while(1){
 		u32 status = readl_relaxed(dma + TX_DMA_CONTROL);
 		if((status & TX_DMA_STATUS_GOING_IDLE_BUSY) == 0) return status & TX_DMA_STATUS_GOING_IDLE_VALUE;
@@ -147,7 +149,7 @@ struct spinal_sgeth {
 	void __iomem *tx_dma;
 	spinlock_t tx_lock;
 	int tx_desc_count;
-	int tx_desc_alloc, tx_desc_free;
+	int tx_desc_alloc, tx_desc_sent, tx_desc_free;
 	volatile struct sgeth_tx_descriptor *tx_desc_virt;
 	dma_addr_t tx_desc_phys;
 	int tx_irq;
@@ -165,7 +167,14 @@ struct spinal_sgeth {
 	spinlock_t rx_lock;
 	int rx_irq_first;
 	u32 rx_irq_config;
+
+	struct timer_list poll_timer;
+
 };
+
+inline static int spinal_sgeth_get_tx_available(struct spinal_sgeth *priv){
+	return priv->tx_desc_count - (priv->tx_desc_alloc - priv->tx_desc_free); //TODO 20
+}
 
 static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 {
@@ -173,39 +182,40 @@ static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 	struct spinal_sgeth *priv = netdev_priv(ndev);
 	unsigned long flags;
 
-//	printk("spinal_sgeth_tx_irq\n");
 	spin_lock_irqsave(&priv->tx_lock, flags);
-	mb();
+	smp_mb();
 
 	int desc_id = priv->tx_desc_free;
-	while(desc_id != priv->tx_desc_alloc) {
+
+	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
+
+	while(desc_id != priv->tx_desc_sent) {
 		int desc_id_masked = desc_id & (priv->tx_desc_count-1);
 		struct sgeth_tx_descriptor *desc = &priv->tx_desc_virt[desc_id_masked];
 		struct sk_buff *skb;
-//		printk("1 %d\n", desc_id_masked);
 
 		writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
 
 		if (!(desc->status & TX_DMA_DESC_STATUS_COMPLETED))
 			break;
 
-//		printk("2 %08x\n", desc->status);
 		skb = priv->tx_skb[desc_id_masked];
 		if(skb){
 			dev_kfree_skb_any(skb);
 			priv->tx_skb[desc_id_masked] = NULL;
 		}
 		desc_id += 1;
-
-//		printk("3\n");
 	}
 
 	priv->tx_desc_free = desc_id;
-
-
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 
-//	printk("4\n");
+	if (netif_queue_stopped(ndev)) {
+		smp_mb();
+		if (spinal_sgeth_get_tx_available(priv) >= MAX_SKB_FRAGS + 1) {
+			netif_wake_queue(ndev);
+		}
+	}
 	return IRQ_HANDLED;
 }
 
@@ -340,12 +350,15 @@ static int spinal_sgeth_open(struct net_device *ndev)
 //		return err;
 //	}
 
-	priv->tx_desc_count = 128;
+	priv->tx_desc_count = 256; //Need to be more than MAX_SKB_FRAGS + 1
 	priv->tx_desc_alloc = 0;
+	priv->tx_desc_sent = 0;
 	priv->tx_desc_free = 0;
 	priv->tx_desc_virt = dma_alloc_coherent(ndev->dev.parent,
 					 sizeof(struct sgeth_tx_descriptor) * priv->tx_desc_count,
 					 &priv->tx_desc_phys, GFP_KERNEL);
+
+	netdev_info(ndev, "tx_desc_phys %p %lx\n", priv->tx_desc_virt, priv->tx_desc_phys);
 
 	if (!priv->tx_desc_virt){
 		netdev_err(ndev, "Can't allocate DMA space\n");
@@ -410,7 +423,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 
 	priv->tx_irq_config |= TX_DMA_IRQ_DELAY_ENABLE | (200 << TX_DMA_IRQ_DELAY_LIMIT_AT);
 	priv->tx_irq_config |= TX_DMA_IRQ_COUNTER_ENABLE | ((priv->tx_desc_count+3)/4 << TX_DMA_IRQ_COUNTER_TARGET_AT);
-	priv->tx_irq_config = 0;
+//	priv->tx_irq_config = 0;
 	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
 
 	return 0;
@@ -438,6 +451,8 @@ static int spinal_sgeth_stop(struct net_device *ndev)
 }
 
 
+
+
 static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 				      struct net_device *ndev)
 {
@@ -445,13 +460,14 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 //	netdev_info(ndev, "spinal_sgeth_start_xmit %d %d\n", skb->len, skb_shinfo(skb)->nr_frags);
 	unsigned long num_frag;
 	skb_frag_t *frag;
-	int desc_id, desc_id_masked;
+	int desc_id, desc_id_masked, first_id;
 	dma_addr_t skb_dma_addr;
 	volatile struct sgeth_tx_descriptor * desc;
 
 	frag = &skb_shinfo(skb)->frags[0];
 	num_frag = skb_shinfo(skb)->nr_frags;
 	desc_id = priv->tx_desc_alloc;
+	first_id = desc_id;
 	desc_id_masked = desc_id & (priv->tx_desc_count-1);
 //	netdev_info(ndev, "skb %d ", skb_frag_size(frag));
 
@@ -466,19 +482,31 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 //		netdev_info(ndev, "CHECKSUM_PARTIAL ??\n");
 //	}
 
+	if (spinal_sgeth_get_tx_available(priv) < num_frag + 1) {
+		netdev_err(ndev, "NETDEV_TX_BUSY ????\n");
+		return NETDEV_TX_BUSY;
+	}
+
+	priv->tx_desc_alloc += num_frag + 1;
+	if (spinal_sgeth_get_tx_available(priv) < MAX_SKB_FRAGS + 1){
+		smp_mb();
+		netif_stop_queue(ndev);
+	}
+
+
 	skb_dma_addr = dma_map_single(ndev->dev.parent, skb->data,
 				      skb_headlen(skb), DMA_TO_DEVICE);
 	if (WARN_ON_ONCE(dma_mapping_error(ndev->dev.parent, skb_dma_addr))) {
 		dev_kfree_skb_any(skb);
 		ndev->stats.tx_dropped++;
+		priv->tx_desc_alloc -= num_frag + 1;
 		return NETDEV_TX_OK;
 	}
 
 //	printk("A\n");
 	desc = priv->tx_desc_virt + desc_id_masked;
 	desc->from = skb_dma_addr;
-	desc->control = skb_headlen(skb) | (num_frag == 0 ? TX_DMA_DESC_CONTROL_LAST | TX_DMA_DESC_CONTROL_IRQ : 0);
-	desc->status = 0;
+	desc->control = skb_headlen(skb) | TX_DMA_DESC_CONTROL_IRQ | (num_frag == 0 ? TX_DMA_DESC_CONTROL_LAST : 0);
 	desc_id += 1;
 	desc_id_masked = desc_id & (priv->tx_desc_count-1);
 //	printk("B\n");
@@ -497,7 +525,7 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 					      skb_frag_size(frag),
 					      DMA_TO_DEVICE);
 		if (dma_mapping_error(ndev->dev.parent, skb_dma_addr)) {
-			netdev_err_once(ndev, "??? X\n");
+			netdev_err(ndev, "??? X\n");
 //			if (--lp->tx_bd_tail < 0)
 //				lp->tx_bd_tail = lp->tx_bd_num - 1;
 //			cur_p = &lp->tx_bd_v[lp->tx_bd_tail];
@@ -516,10 +544,11 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 //					 skb_headlen(skb), DMA_TO_DEVICE);
 //			dev_kfree_skb_any(skb);
 //			ndev->stats.tx_dropped++;
+			priv->tx_desc_alloc -= num_frag + 1;
 			return NETDEV_TX_OK;
 		}
 		desc->from = skb_dma_addr;
-		desc->control = skb_frag_size(frag) | (ii == num_frag-1 ? TX_DMA_DESC_CONTROL_LAST | TX_DMA_DESC_CONTROL_IRQ : 0);
+		desc->control = skb_frag_size(frag) | TX_DMA_DESC_CONTROL_IRQ | (ii == num_frag-1 ? TX_DMA_DESC_CONTROL_LAST : 0);
 		frag++;
 //		netdev_info(ndev, "skb %d ", skb_frag_size(frag));
 		desc_id += 1;
@@ -530,43 +559,34 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 	unsigned long flags;
 	spin_lock_irqsave(&priv->tx_lock, flags);
 
+	int desc_last_id = (desc_id-1) & (priv->tx_desc_count-1) ;
+	priv->tx_skb[desc_last_id] = skb;
+
+
 	int from = desc_id;
-	int to = priv->tx_desc_alloc;
+	int to = first_id;
 	while(from != to){
 		from -= 1;
 		priv->tx_desc_virt[from & (priv->tx_desc_count-1)].status = 0;
 	}
 
-//	printk("D\n");
-	int desc_last_id = (desc_id-1) & (priv->tx_desc_count-1) ;
-	priv->tx_skb[desc_last_id] = skb;
-	int first_id_masked = priv->tx_desc_alloc & (priv->tx_desc_count-1);
-	priv->tx_desc_alloc = desc_id;
-	mb();
+	priv->tx_desc_sent += num_frag + 1;
+
+	smp_mb();
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 
-//	printk("E\n");
-	if(spinal_sgeth_tx_dma_is_going_idle(priv->tx_dma)){
 
-//		printk("F\n");
+	if(spinal_sgeth_tx_dma_is_going_idle(priv->tx_dma)){
 		while(spinal_sgeth_tx_dma_busy(priv->tx_dma));
 
-//		printk("G\n");
+		int first_id_masked = first_id & (priv->tx_desc_count-1);
 		spinal_sgeth_tx_dma_set_next(priv->tx_dma, priv->tx_desc_phys + first_id_masked * sizeof(struct sgeth_tx_descriptor));
 		spinal_sgeth_tx_dma_start(priv->tx_dma);
 	}
 
 
-	while(spinal_sgeth_tx_dma_busy(priv->tx_dma));
-	dev_kfree_skb_any(skb); //TODO maybe not any but irq once moved there
-
-
-//	printk("H\n");
-//	netdev_info(ndev, "sent %x", priv->tx_desc_virt[priv->tx_desc_alloc].status);
-
-
-
-
+//	while(spinal_sgeth_tx_dma_busy(priv->tx_dma));
+//	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
 
@@ -714,6 +734,33 @@ static const struct net_device_ops spinal_sgeth_netdev_ops = {
 };
 
 
+static void sgeth_timer(struct timer_list *t)
+{
+	struct spinal_sgeth *priv = from_timer(priv, t, poll_timer);
+	static int trigerred = 0;
+	if(priv->tx_desc_virt){
+		printk("RPT: %d %d %d %d %x\n", priv->tx_desc_alloc, priv->tx_desc_sent, priv->tx_desc_free, spinal_sgeth_tx_dma_busy(priv->tx_dma), priv->tx_desc_virt[priv->tx_desc_free & (priv->tx_desc_count-1)].status);
+		int id = priv->tx_desc_free & (priv->tx_desc_count-1);
+		int desc_done = priv->tx_desc_virt[id].status & TX_DMA_DESC_STATUS_COMPLETED;
+
+		if(!desc_done && spinal_sgeth_tx_dma_is_going_idle(priv->tx_dma)){
+	//		printk("G\n");
+			trigerred = trigerred + 1;
+			if(trigerred == 8){
+				printk("Try restart\n");
+				spinal_sgeth_tx_dma_set_next(priv->tx_dma, priv->tx_desc_phys + id * sizeof(struct sgeth_tx_descriptor));
+				spinal_sgeth_tx_dma_start(priv->tx_dma);
+			}
+		} else {
+			trigerred = 0;
+		}
+
+
+	}
+	mod_timer(&priv->poll_timer, jiffies + msecs_to_jiffies(1000));
+}
+
+
 static int spinal_sgeth_probe(struct platform_device *pdev)
 {
 	struct net_device *ndev;
@@ -803,6 +850,10 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 
 	netdev_info(ndev, "Hello world \n");
 	netdev_dbg(ndev, "Brawwwww\n");
+
+//	timer_setup(&priv->poll_timer, sgeth_timer, 0);
+//	mod_timer(&priv->poll_timer, jiffies + msecs_to_jiffies(50));
+
 	return 0;
 }
 
