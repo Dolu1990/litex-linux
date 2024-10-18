@@ -335,7 +335,7 @@ inline static void spinal_sgeth_rx_ensure_started(struct spinal_sgeth *priv) {
 		spinal_sgeth_rx_dma_set_next(priv->rx_dma, priv->rx_desc_phys + priv->rx_desc_ptr * sizeof(struct sgeth_rx_descriptor));
 		mb();
 		spinal_sgeth_rx_dma_start(priv->rx_dma);
-		if(!priv->rx_irq_first) dev_err_ratelimited(priv->dev, "DMA RX ran out of descriptors :(");
+//		if(!priv->rx_irq_first) dev_err_ratelimited(priv->dev, "DMA RX ran out of descriptors :(");
 	}
 	priv->rx_irq_first = 0;
 }
@@ -451,7 +451,6 @@ static int spinal_sgeth_open(struct net_device *ndev)
 
 	priv->tx_irq_config |= TX_DMA_IRQ_DELAY_ENABLE | (200 << TX_DMA_IRQ_DELAY_LIMIT_AT);
 	priv->tx_irq_config |= TX_DMA_IRQ_COUNTER_ENABLE | ((priv->tx_desc_count+3)/4 << TX_DMA_IRQ_COUNTER_TARGET_AT);
-//	priv->tx_irq_config = 0;
 	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
 	spinal_sgeth_tx_dma_irq_enable(priv->tx_dma);
 
@@ -607,10 +606,11 @@ static netdev_tx_t spinal_sgeth_start_xmit(struct sk_buff *skb,
 
 	if(spinal_sgeth_tx_dma_is_going_idle(priv->tx_dma)){
 		while(spinal_sgeth_tx_dma_busy(priv->tx_dma));
-
 		int first_id_masked = first_id & (priv->tx_desc_count-1);
-		spinal_sgeth_tx_dma_set_next(priv->tx_dma, priv->tx_desc_phys + first_id_masked * sizeof(struct sgeth_tx_descriptor));
-		spinal_sgeth_tx_dma_start(priv->tx_dma);
+		if((priv->tx_desc_virt[first_id_masked].status & TX_DMA_DESC_STATUS_COMPLETED) == 0){
+			spinal_sgeth_tx_dma_set_next(priv->tx_dma, priv->tx_desc_phys + first_id_masked * sizeof(struct sgeth_tx_descriptor));
+			spinal_sgeth_tx_dma_start(priv->tx_dma);
+		}
 	}
 
 
