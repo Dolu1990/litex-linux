@@ -207,7 +207,7 @@ static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 
 	while(desc_id != priv->tx_desc_sent) {
 		int desc_id_masked = desc_id & (priv->tx_desc_count-1);
-		struct sgeth_tx_descriptor *desc = &priv->tx_desc_virt[desc_id_masked];
+		volatile struct sgeth_tx_descriptor *desc = &priv->tx_desc_virt[desc_id_masked];
 		struct sk_buff *skb;
 
 		writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
@@ -269,7 +269,7 @@ static int spinal_sgeth_rx_refresh(struct spinal_sgeth *priv, int budget)
 
 	while(works != budget) {
 		int desc_ptr = priv->rx_desc_ptr;
-		struct sgeth_rx_descriptor *desc = &priv->rx_desc_virt[desc_ptr];
+		volatile struct sgeth_rx_descriptor *desc = &priv->rx_desc_virt[desc_ptr];
 		struct sk_buff *skb;
 		int length;
 
@@ -312,7 +312,7 @@ static int spinal_sgeth_rx_refresh(struct spinal_sgeth *priv, int budget)
 			works += 1;
 		}
 
-		if(err = spinal_sgeth_rx_refill(priv, desc_ptr)) {
+		if((err = spinal_sgeth_rx_refill(priv, desc_ptr))) {
 			dev_err_ratelimited(priv->dev, "spinal_sgeth_rx_refill failed :(");
 			return works;
 		}
@@ -366,8 +366,6 @@ static int spinal_sgeth_poll(struct napi_struct *napi, int budget){
 static int spinal_sgeth_open(struct net_device *ndev)
 {
 	struct spinal_sgeth *priv = netdev_priv(ndev);
-	struct sk_buff *skb;
-	dma_addr_t skb_dma_addr;
 	int err;
 
 	netdev_info(ndev, "spinal_sgeth_open\n");
@@ -387,7 +385,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 					 sizeof(struct sgeth_tx_descriptor) * priv->tx_desc_count,
 					 &priv->tx_desc_phys, GFP_KERNEL);
 
-	netdev_info(ndev, "tx_desc_phys %p %lx\n", priv->tx_desc_virt, priv->tx_desc_phys);
+	netdev_info(ndev, "tx_desc_phys %p %llx\n", priv->tx_desc_virt, priv->tx_desc_phys);
 
 	if (!priv->tx_desc_virt){
 		netdev_err(ndev, "Can't allocate DMA space\n");
@@ -468,8 +466,6 @@ static int spinal_sgeth_open(struct net_device *ndev)
 
 static int spinal_sgeth_stop(struct net_device *ndev)
 {
-	struct spinal_sgeth *priv = netdev_priv(ndev);
-
 	netdev_info(ndev, "spinal_sgeth_stop\n");
 
 	netif_stop_queue(ndev);
@@ -762,7 +758,7 @@ static const struct net_device_ops spinal_sgeth_netdev_ops = {
 	.ndo_start_xmit         = spinal_sgeth_start_xmit,
 };
 
-
+/*
 static void sgeth_timer(struct timer_list *t)
 {
 	struct spinal_sgeth *priv = from_timer(priv, t, poll_timer);
@@ -787,13 +783,12 @@ static void sgeth_timer(struct timer_list *t)
 
 	}
 	mod_timer(&priv->poll_timer, jiffies + msecs_to_jiffies(1000));
-}
+}*/
 
 
 static int spinal_sgeth_probe(struct platform_device *pdev)
 {
 	struct net_device *ndev;
-	void __iomem *buf_base;
 	struct spinal_sgeth *priv;
 	int err;
 	ndev = devm_alloc_etherdev(&pdev->dev, sizeof(*priv));
