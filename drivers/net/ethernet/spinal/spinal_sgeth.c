@@ -486,12 +486,12 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	priv->rx_irq_first = 1;
 	priv->rx_irq_config  = RX_DMA_IRQ_IDLE_ENABLE;
 	priv->rx_irq_config |= RX_DMA_IRQ_DELAY_ENABLE | (50 << RX_DMA_IRQ_DELAY_LIMIT_AT);
-	priv->rx_irq_config |= RX_DMA_IRQ_COUNTER_ENABLE | ((priv->rx_desc_count+3)/4 << RX_DMA_IRQ_COUNTER_TARGET_AT);
+	priv->rx_irq_config |= RX_DMA_IRQ_COUNTER_ENABLE | (min(255,(priv->rx_desc_count+3)/4) << RX_DMA_IRQ_COUNTER_TARGET_AT);
 	writel_relaxed(priv->rx_irq_config, priv->rx_dma + RX_DMA_IRQ);
 	spinal_sgeth_rx_dma_irq_enable(priv->rx_dma);
 
 	priv->tx_irq_config |= TX_DMA_IRQ_DELAY_ENABLE | (200 << TX_DMA_IRQ_DELAY_LIMIT_AT);
-	priv->tx_irq_config |= TX_DMA_IRQ_COUNTER_ENABLE | ((priv->tx_desc_count+3)/4 << TX_DMA_IRQ_COUNTER_TARGET_AT);
+	priv->tx_irq_config |= TX_DMA_IRQ_COUNTER_ENABLE | (min(255,(priv->tx_desc_count+3)/4) << TX_DMA_IRQ_COUNTER_TARGET_AT);
 	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
 	spinal_sgeth_tx_dma_irq_enable(priv->tx_dma);
 
