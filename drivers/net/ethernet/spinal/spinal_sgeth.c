@@ -182,6 +182,7 @@ struct spinal_sgeth {
 	int tx_irq;
 	int tx_irq_config;
 	struct sk_buff **tx_skb;
+	struct napi_struct tx_napi;
 
 	/* Rx */
 	void __iomem *rx_dma;
@@ -204,10 +205,11 @@ inline static int spinal_sgeth_get_tx_available(struct spinal_sgeth *priv){
 	return priv->tx_desc_count - (priv->tx_desc_alloc - priv->tx_desc_free);
 }
 
-static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
+
+
+static int spinal_sgeth_tx_refresh(struct spinal_sgeth *priv, int budget)
 {
-	struct net_device *ndev = _ndev;
-	struct spinal_sgeth *priv = netdev_priv(ndev);
+	int works = 0;
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->tx_lock, flags);
@@ -217,7 +219,7 @@ static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 
 	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
 
-	while(desc_id != priv->tx_desc_sent) {
+	while(works != budget && desc_id != priv->tx_desc_sent) {
 		int desc_id_masked = desc_id & (priv->tx_desc_count-1);
 		struct sgeth_tx_descriptor *desc = &priv->tx_desc_virt[desc_id_masked];
 		struct sk_buff *skb;
@@ -229,23 +231,47 @@ static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
 
 		skb = priv->tx_skb[desc_id_masked];
 		if(skb){
-			dev_kfree_skb_any(skb);
+			napi_consume_skb(skb, budget);
 			priv->tx_skb[desc_id_masked] = NULL;
 		}
 		desc_id += 1;
+		works += 1;
 	}
 
 	priv->tx_desc_free = desc_id;
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 
-	if (netif_queue_stopped(ndev)) {
+	if (netif_queue_stopped(priv->ndev)) {
 		smp_mb();
 		if (spinal_sgeth_get_tx_available(priv) >= MAX_SKB_FRAGS + 1) {
-			netif_wake_queue(ndev);
+			netif_wake_queue(priv->ndev);
 		}
 	}
+	return works;
+}
+
+
+static irqreturn_t spinal_sgeth_tx_irq(int irq, void *_ndev)
+{
+	struct net_device *ndev = _ndev;
+	struct spinal_sgeth *priv = netdev_priv(ndev);
+	spinal_sgeth_tx_dma_irq_disable(priv->tx_dma);
+	writel_relaxed(priv->tx_irq_config, priv->tx_dma + TX_DMA_IRQ);
+	napi_schedule(&priv->tx_napi);
 	return IRQ_HANDLED;
 }
+
+static int spinal_sgeth_tx_poll(struct napi_struct *napi, int budget){
+	struct spinal_sgeth *priv = container_of(napi, struct spinal_sgeth, tx_napi);
+
+	int works = spinal_sgeth_tx_refresh(priv, budget);
+	if (works < budget) {
+		napi_complete_done(napi, works);
+		spinal_sgeth_tx_dma_irq_enable(priv->tx_dma);
+	}
+	return works;
+}
+
 
 
 static inline int spinal_sgeth_rx_refill(struct spinal_sgeth *priv, int index){
@@ -362,7 +388,7 @@ static irqreturn_t spinal_sgeth_rx_irq(int irq, void *_ndev)
 	return IRQ_HANDLED;
 }
 
-static int spinal_sgeth_poll(struct napi_struct *napi, int budget){
+static int spinal_sgeth_rx_poll(struct napi_struct *napi, int budget){
 	struct spinal_sgeth *priv = container_of(napi, struct spinal_sgeth, rx_napi);
 
 	int works = spinal_sgeth_rx_refresh(priv, budget);
@@ -466,6 +492,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	}
 
 	napi_enable(&priv->rx_napi);
+	napi_enable(&priv->tx_napi);
 
 	err = request_irq(priv->tx_irq, spinal_sgeth_tx_irq, 0, ndev->name, ndev);
 	if (err){
@@ -504,6 +531,8 @@ static int spinal_sgeth_open(struct net_device *ndev)
  err_tx_irq:
 	napi_disable(&priv->rx_napi);
  err_alloc:
+	napi_disable(&priv->rx_napi);
+	napi_disable(&priv->tx_napi);
  	spinal_sgeth_release(ndev);
 	return err;
 }
@@ -524,6 +553,7 @@ static int spinal_sgeth_stop(struct net_device *ndev)
 	spinal_sgeth_rx_dma_stop(priv->rx_dma);
 	free_irq(priv->rx_irq, ndev);
 	napi_disable(&priv->rx_napi);
+	napi_disable(&priv->tx_napi);
 
  	spinal_sgeth_release(ndev);
 	return 0;
@@ -901,7 +931,8 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 		return err;
 	}
 
-	netif_napi_add(ndev, &priv->rx_napi, spinal_sgeth_poll);
+	netif_napi_add(ndev, &priv->rx_napi, spinal_sgeth_rx_poll);
+	netif_napi_add(ndev, &priv->tx_napi, spinal_sgeth_tx_poll);
 
 	netdev_info(ndev, "probe success\n");
 
