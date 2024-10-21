@@ -35,7 +35,11 @@ ethtool -k eth0
 tx 170 -> hw crc 250 -> tso 350
  */
 
-//#define DEBUG
+#define TX_DESC_COUNT_DEFAULT		512
+#define RX_DESC_COUNT_DEFAULT		512
+#define TX_DESC_COUNT_MAX			4096
+#define RX_DESC_COUNT_MAX			4096
+
 
 #define DRV_NAME	"spinal-sgeth"
 #define TX_DMA_CONTROL 0x00
@@ -411,7 +415,6 @@ static int spinal_sgeth_open(struct net_device *ndev)
 
 	netdev_info(ndev, "spinal_sgeth_open\n");
 
-	priv->tx_desc_count = 256; //Need to be more than MAX_SKB_FRAGS + 1
 	priv->tx_desc_alloc = 0;
 	priv->tx_desc_sent = 0;
 	priv->tx_desc_free = 0;
@@ -439,7 +442,6 @@ static int spinal_sgeth_open(struct net_device *ndev)
 		goto err_alloc;
 	}
 
-	priv->rx_desc_count = 256;
 	priv->rx_desc_ptr = 0;
 	priv->rx_desc_virt = dma_alloc_coherent(ndev->dev.parent,
 					 sizeof(struct sgeth_rx_descriptor) * priv->rx_desc_count,
@@ -707,6 +709,107 @@ static void sgeth_timer(struct timer_list *t)
 }*/
 
 
+static void ll_spinal_sgeth_ethtools_get_ringparam(
+		        struct net_device *ndev,
+				struct ethtool_ringparam *ering,
+				struct kernel_ethtool_ringparam *kernel_ering,
+				struct netlink_ext_ack *extack)
+{
+	struct spinal_sgeth *priv = netdev_priv(ndev);
+
+	ering->rx_max_pending = RX_DESC_COUNT_MAX;
+	ering->rx_mini_max_pending = 0;
+	ering->rx_jumbo_max_pending = 0;
+	ering->tx_max_pending = TX_DESC_COUNT_MAX;
+	ering->rx_pending = priv->rx_desc_count;
+	ering->rx_mini_pending = 0;
+	ering->rx_jumbo_pending = 0;
+	ering->tx_pending = priv->tx_desc_count;
+}
+
+static int ll_spinal_sgeth_ethtools_set_ringparam(
+		        struct net_device *ndev,
+				struct ethtool_ringparam *ering,
+				struct kernel_ethtool_ringparam *kernel_ering,
+				struct netlink_ext_ack *extack)
+{
+	struct spinal_sgeth *priv = netdev_priv(ndev);
+
+	if (ering->rx_pending > RX_DESC_COUNT_MAX ||
+	    ering->rx_mini_pending ||
+	    ering->rx_jumbo_pending ||
+	    ering->rx_pending > TX_DESC_COUNT_MAX ||
+		!is_power_of_2(ering->rx_pending) ||
+		!is_power_of_2(ering->tx_pending))
+		return -EINVAL;
+
+	if (netif_running(ndev))
+		return -EBUSY;
+
+	priv->rx_desc_count = ering->rx_pending;
+	priv->tx_desc_count = ering->tx_pending;
+	return 0;
+}
+
+//static int ll_spinal_sgeth_ethtools_get_coalesce(
+//				   struct net_device *ndev,
+//			       struct ethtool_coalesce *ec,
+//			       struct kernel_ethtool_coalesce *kernel_coal,
+//			       struct netlink_ext_ack *extack)
+//{
+//	struct spinal_sgeth_local *lp = netdev_priv(ndev);
+//
+//	ec->rx_max_coalesced_frames = lp->coalesce_count_rx;
+//	ec->tx_max_coalesced_frames = lp->coalesce_count_tx;
+//	ec->rx_coalesce_usecs = (lp->coalesce_delay_rx * 512) / 100;
+//	ec->tx_coalesce_usecs = (lp->coalesce_delay_tx * 512) / 100;
+//	return 0;
+//}
+//
+//static int ll_spinal_sgeth_ethtools_set_coalesce(struct net_device *ndev,
+//			       struct ethtool_coalesce *ec,
+//			       struct kernel_ethtool_coalesce *kernel_coal,
+//			       struct netlink_ext_ack *extack)
+//{
+//	struct spinal_sgeth_local *lp = netdev_priv(ndev);
+//
+//	if (netif_running(ndev)) {
+//		netdev_err(ndev,
+//			   "Please stop netif before applying configuration\n");
+//		return -EFAULT;
+//	}
+//
+//	if (ec->rx_max_coalesced_frames)
+//		lp->coalesce_count_rx = ec->rx_max_coalesced_frames;
+//	if (ec->tx_max_coalesced_frames)
+//		lp->coalesce_count_tx = ec->tx_max_coalesced_frames;
+//	/* With typical LocalLink clock speed of 200 MHz and
+//	 * C_PRESCALAR=1023, each delay count corresponds to 5.12 us.
+//	 */
+//	if (ec->rx_coalesce_usecs)
+//		lp->coalesce_delay_rx =
+//			min(255U, (ec->rx_coalesce_usecs * 100) / 512);
+//	if (ec->tx_coalesce_usecs)
+//		lp->coalesce_delay_tx =
+//			min(255U, (ec->tx_coalesce_usecs * 100) / 512);
+//
+//	return 0;
+//}
+
+static const struct ethtool_ops spinal_sgeth_ethtool_ops = {
+//	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+//				     ETHTOOL_COALESCE_MAX_FRAMES,
+//	.nway_reset = phy_ethtool_nway_reset,
+//	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+//	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+	.get_ringparam	= ll_spinal_sgeth_ethtools_get_ringparam,
+	.set_ringparam	= ll_spinal_sgeth_ethtools_set_ringparam,
+//	.get_coalesce	= ll_spinal_sgeth_ethtools_get_coalesce,
+//	.set_coalesce	= ll_spinal_sgeth_ethtools_set_coalesce,
+};
+
+
+
 static int spinal_sgeth_probe(struct platform_device *pdev)
 {
 	struct net_device *ndev;
@@ -762,8 +865,10 @@ static int spinal_sgeth_probe(struct platform_device *pdev)
 	if (err)
 		eth_hw_addr_random(ndev);
 
+	priv->tx_desc_count = TX_DESC_COUNT_DEFAULT;
+	priv->rx_desc_count = RX_DESC_COUNT_DEFAULT;
 
-
+	ndev->ethtool_ops = &spinal_sgeth_ethtool_ops;
 	ndev->netdev_ops = &spinal_sgeth_netdev_ops;
 	ndev->features  = NETIF_F_SG;
 	ndev->features |= NETIF_F_HIGHDMA;
