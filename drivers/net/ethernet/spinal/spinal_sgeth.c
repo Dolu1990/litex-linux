@@ -67,7 +67,7 @@ tx 170 -> hw crc 250 -> tso 350
 #define SGETH_HDR_SIZE			14      /* size of Ethernet header */
 #define SGETH_TRL_SIZE			4       /* size of Ethernet trailer (FCS) */
 #define SGETH_JUMBO_MTU			1500//9000
-#define SGETH_MAX_JUMBO_FRAME_SIZE	(SGETH_JUMBO_MTU + SGETH_HDR_SIZE + SGETH_TRL_SIZE)
+#define SGETH_MAX_JUMBO_FRAME_SIZE	(SGETH_JUMBO_MTU + SGETH_HDR_SIZE + SGETH_TRL_SIZE + 1)
 
 
 
@@ -325,7 +325,7 @@ static int spinal_sgeth_rx_refresh(struct spinal_sgeth *priv, int budget)
 			dma_unmap_single(priv->dev->parent, desc->to,
 					SGETH_MAX_JUMBO_FRAME_SIZE, DMA_FROM_DEVICE);
 
-			length = (desc->status & 0x3FFF) - SGETH_TRL_SIZE;
+			length = (desc->status & 0x3FFF) - 1;
 
 //			if (netif_msg_pktdata(priv)) {
 //			netdev_info(priv->ndev, "frame received %d bytes\n",
@@ -334,14 +334,12 @@ static int spinal_sgeth_rx_refresh(struct spinal_sgeth *priv, int budget)
 //					   16, 1, skb->data, length, 1);
 //			}
 
-			skb_put(skb, length);
-			skb->protocol = eth_type_trans(skb, priv->ndev);
-			skb->ip_summed = CHECKSUM_UNNECESSARY;
+			skb->ip_summed = skb->data[length]; //Either CHECKSUM_NONE or CHECKSUM_UNNECESSARY
 
-////			if (!skb_defer_rx_timestamp(skb)){
+			skb_put(skb, length - SGETH_TRL_SIZE);
+			skb->protocol = eth_type_trans(skb, priv->ndev);
+
 			napi_gro_receive(&priv->rx_napi, skb);
-//			}
-			/* The skb buffer is now owned by network stack above */
 			priv->rx_skb[desc_ptr] = NULL;
 
 			priv->ndev->stats.rx_packets++;
@@ -439,7 +437,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	struct spinal_sgeth *priv = netdev_priv(ndev);
 	int err;
 
-	netdev_info(ndev, "spinal_sgeth_open\n");
+	netdev_dbg(ndev, "spinal_sgeth_open\n");
 
 	priv->tx_desc_alloc = 0;
 	priv->tx_desc_sent = 0;
@@ -481,7 +479,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 		int i_next = (i+1) % priv->rx_desc_count;
 		priv->rx_desc_virt[i].status = RX_DMA_DESC_STATUS_COMPLETED;
 		priv->rx_desc_virt[i].next = priv->rx_desc_phys + i_next * sizeof(struct sgeth_rx_descriptor);
-		priv->rx_desc_virt[i].control = SGETH_MAX_JUMBO_FRAME_SIZE | RX_DMA_DESC_CONTROL_IRQ_ALL;
+		priv->rx_desc_virt[i].control = (SGETH_MAX_JUMBO_FRAME_SIZE | RX_DMA_DESC_CONTROL_IRQ_ALL);
 	}
 
 	priv->rx_skb = devm_kcalloc(&ndev->dev, priv->rx_desc_count,
@@ -523,7 +521,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 	spinal_sgeth_tx_dma_irq_enable(priv->tx_dma);
 
 
-	netdev_info(ndev, "open with descriptors at %pad %pad\n", &priv->rx_desc_phys, &priv->tx_desc_phys);
+	netdev_dbg(ndev, "open with descriptors at %pad %pad\n", &priv->rx_desc_phys, &priv->tx_desc_phys);
 	return 0;
 
  err_rx_irq:
@@ -540,7 +538,7 @@ static int spinal_sgeth_open(struct net_device *ndev)
 static int spinal_sgeth_stop(struct net_device *ndev)
 {
 	struct spinal_sgeth *priv = netdev_priv(ndev);
-	netdev_info(ndev, "spinal_sgeth_stop\n");
+	netdev_dbg(ndev, "spinal_sgeth_stop\n");
 
 	netif_stop_queue(ndev);
 	netif_carrier_off(ndev);
